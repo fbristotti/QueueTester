@@ -32,16 +32,58 @@ namespace ServiceBrokerConsumer
             _endConversationCommand?.Dispose();
         }
 
-        protected async Task<SqlConnection> GetConnectionAsync(CancellationToken token)
+        public async Task ConsumeAsync(CancellationToken token)
         {
-            if(_connection == null)
+            while (!token.IsCancellationRequested)
             {
-                var connetionString = ConfigurationManager.ConnectionStrings["testdb"].ConnectionString;
-                _connection = new SqlConnection(connetionString);
-                await _connection.OpenAsync(token);
+                var messages = await NextMessagesAsync(token);
+
+                foreach (var message in messages)
+                {
+                    if (message.MsgType != "DEFAULT")
+                        continue;
+
+                    await Task.Delay(1000); // simulate a heavy task
+
+                    message.Raw += ". Done!";
+                    Console.WriteLine($"Received message: {message.Raw}");
+                }
+
+                await SendMessages(messages, token);
+                await EndConversationAsync(messages, token);
+                Console.WriteLine("end conversation");
+            }
+        }
+        private async Task<IList<Message>> NextMessagesAsync(CancellationToken token)
+        {
+            var command = await GetReceiveMessageCommand(token);
+            var messages = new List<Message>();
+
+            using (var reader = await command.ExecuteReaderAsync(token))
+            {
+                while (await reader.ReadAsync(token))
+                {
+                    messages.Add(new Message
+                    {
+                        Handle = (Guid)reader[0],
+                        Raw = (string)reader[1],
+                        MsgType = (string)reader[2]
+                    });
+                }
             }
 
-            return _connection;
+            return messages;
+        }
+        private async Task SendMessages(IList<Message> messages, CancellationToken token)
+        {
+            var command = await GetSendMessageCommand(token);
+
+            foreach(var message in messages)
+            {
+                command.Parameters["@handle"].Value = message.Handle;
+                command.Parameters["@message"].Value = message.Raw;
+                await command.ExecuteNonQueryAsync(token);
+            }
         }
 
         protected async Task EndConversationAsync(IList<Message> messages, CancellationToken token)
@@ -55,22 +97,16 @@ namespace ServiceBrokerConsumer
             command.Parameters["@handle"].Value = handle.Value;
             await command.ExecuteNonQueryAsync(token);
         }
-
-        public async Task ConsumeAsync(CancellationToken token)
+        protected async Task<SqlConnection> GetConnectionAsync(CancellationToken token)
         {
-            while (!token.IsCancellationRequested)
+            if (_connection == null)
             {
-                var messages = await NextMessagesAsync(token);
-
-                foreach(var message in messages)
-                {
-                    Console.WriteLine($"Received message: {message.Raw}");
-                }
-
-                await Task.Delay(2000);
-                await EndConversationAsync(messages, token);
-                Console.WriteLine("end conversation");
+                var connetionString = ConfigurationManager.ConnectionStrings["testdb"].ConnectionString;
+                _connection = new SqlConnection(connetionString);
+                await _connection.OpenAsync(token);
             }
+
+            return _connection;
         }
 
         private SqlCommand _receiveMessageCommand;
@@ -78,13 +114,30 @@ namespace ServiceBrokerConsumer
         {
             if (_receiveMessageCommand == null)
             {
-                var query = $"waitfor(receive conversation_handle, convert(varchar, message_body) from {QueueName}), timeout -1;";
+                var query = $"waitfor(receive conversation_handle, convert(varchar, message_body), message_type_name from {QueueName}), timeout -1;";
                 _receiveMessageCommand = new SqlCommand(query, await GetConnectionAsync(token))
                 {
                     CommandTimeout = 0
                 };
             }
             return _receiveMessageCommand;
+        }
+
+        private SqlCommand _sendMessageCommand;
+        private async Task<SqlCommand> GetSendMessageCommand(CancellationToken token)
+        {
+            if (_sendMessageCommand == null)
+            {
+                var query = $"SEND ON CONVERSATION @handle(@message)";
+
+                _sendMessageCommand = new SqlCommand(query, await GetConnectionAsync(token));
+                _sendMessageCommand.Parameters.AddRange(new[]
+                {
+                    new SqlParameter("@handle", System.Data.SqlDbType.UniqueIdentifier),
+                    new SqlParameter("@message", System.Data.SqlDbType.VarChar, -1)
+                });
+            }
+            return _sendMessageCommand;
         }
 
         private SqlCommand _endConversationCommand;
@@ -98,31 +151,11 @@ namespace ServiceBrokerConsumer
             }
             return _endConversationCommand;
         }
-
-        private async Task<IList<Message>> NextMessagesAsync(CancellationToken token)
-        {
-            var command = await GetReceiveMessageCommand(token);
-            var messages = new List<Message>();
-
-            using (var reader = await command.ExecuteReaderAsync(token))
-            {
-                while (await reader.ReadAsync(token))
-                {
-                    messages.Add(new Message
-                    {
-                        Handle = (Guid)reader[0],
-                        Raw = (string)reader[1]
-                    });
-                }
-            }
-
-            return messages;
-        }
-
         public class Message
         {
             public Guid Handle { get; set; }
             public string Raw { get; set; }
+            public string MsgType { get; set; }
         }
     }
 }
